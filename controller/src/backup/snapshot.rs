@@ -1,92 +1,106 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
-use tokio::time::interval;
 
-/// Represents a persistent volume snapshot state.
+/// Represents a persistent volume snapshot in the system.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub id: String,
     pub volume_id: String,
-    pub created_at: u64,
-    pub is_valid: bool,
+    pub timestamp: u64,
+    pub ledger_sequence: u64,
+    pub status: SnapshotStatus,
 }
 
-/// Controller responsible for managing the lifecycle of storage snapshots.
-/// It aligns snapshot creation with ledger sequence markers to ensure consistency.
-pub struct SnapshotController {
-    /// Interval for checking ledger sequences and triggering snapshots
-    check_interval: Duration,
-    /// Flag to pause database write flushes during snapshot initialization
-    is_flush_paused: Arc<Mutex<bool>>,
+#[derive(Debug, Clone, PartialEq)]
+pub enum SnapshotStatus {
+    Pending,
+    Completed,
+    Failed(String),
+    Retained,
 }
 
-impl SnapshotController {
-    pub fn new(check_interval: Duration) -> Self {
+/// Manages the lifecycle of storage snapshots.
+/// Ensures crash consistency by pausing DB writes during initialization.
+pub struct SnapshotManager {
+    /// Simulated database connection for write flush control
+    db_handle: Arc<DbHandle>,
+    /// List of active snapshots
+    snapshots: Vec<Snapshot>,
+}
+
+impl SnapshotManager {
+    pub fn new(db_handle: Arc<DbHandle>) -> Self {
         Self {
-            check_interval,
-            is_flush_paused: Arc::new(Mutex::new(false)),
+            db_handle,
+            snapshots: Vec::new(),
         }
     }
 
-    /// Starts the controller loop.
-    /// This loop monitors ledger sequences and triggers snapshot API calls
-    /// when a new sequence marker is detected.
-    pub async fn run_loop(self, cloud_manager: Arc<crate::backup::cloud::CloudBackupManager>) {
-        let mut interval = interval(self.check_interval);
-        let mut last_snapshot_sequence: u64 = 0;
-
-        loop {
-            interval.tick().await;
-
-            // In a real implementation, we would query the ledger for the current sequence.
-            // For this simulation, we assume a sequence increment mechanism.
-            let current_sequence = self.get_current_ledger_sequence().await;
-
-            if current_sequence > last_snapshot_sequence {
-                self.trigger_snapshot(&cloud_manager, current_sequence).await;
-                last_snapshot_sequence = current_sequence;
-            }
-        }
-    }
-
-    /// Triggers a snapshot creation aligned with the given ledger sequence.
-    /// Ensures crash consistency by pausing DB write flushes.
-    async fn trigger_snapshot(
-        &self,
-        cloud_manager: &Arc<crate::backup::cloud::CloudBackupManager>,
-        sequence: u64,
-    ) {
+    /// Initiates a snapshot for the given volume ID.
+    /// This operation ensures crash consistency by briefly pausing database write flushes.
+    pub async fn create_snapshot(&mut self, volume_id: &str, ledger_sequence: u64) -> Result<Snapshot, String> {
         // Pause database write flushes to guarantee crash consistency
-        {
-            let mut paused = self.is_flush_paused.lock().await;
-            *paused = true;
-        }
+        self.db_handle.pause_write_flushes().map_err(|e| format!("Failed to pause writes: {}", e))?;
 
-        // Simulate brief pause for DB flush
+        // Simulate snapshot creation delay
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Create snapshot via cloud provider
-        let snapshot_id = cloud_manager.create_snapshot(format!("vol-{}", sequence), sequence).await;
+        let snapshot_id = format!("snap-{}-{}", volume_id, ledger_sequence);
+        let snapshot = Snapshot {
+            id: snapshot_id.clone(),
+            volume_id: volume_id.to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            ledger_sequence,
+            status: SnapshotStatus::Completed,
+        };
 
         // Resume database write flushes
-        {
-            let mut paused = self.is_flush_paused.lock().await;
-            *paused = false;
+        self.db_handle.resume_write_flushes().map_err(|e| format!("Failed to resume writes: {}", e))?;
+
+        self.snapshots.push(snapshot.clone());
+        Ok(snapshot)
+    }
+
+    /// Retrieves a snapshot by ID.
+    pub fn get_snapshot(&self, snapshot_id: &str) -> Option<&Snapshot> {
+        self.snapshots.iter().find(|s| s.id == snapshot_id)
+    }
+
+    /// Lists all snapshots for a specific volume.
+    pub fn list_snapshots_for_volume(&self, volume_id: &str) -> Vec<&Snapshot> {
+        self.snapshots.iter().filter(|s| s.volume_id == volume_id).collect()
+    }
+}
+
+/// Mock database handle to simulate write flush control.
+#[derive(Clone)]
+pub struct DbHandle {
+    paused: std::sync::atomic::AtomicBool,
+}
+
+impl DbHandle {
+    pub fn new() -> Self {
+        Self {
+            paused: std::sync::atomic::AtomicBool::new(false),
         }
-
-        println!("Snapshot created for sequence {}: {}", sequence, snapshot_id);
     }
 
-    /// Simulates fetching the current ledger sequence.
-    async fn get_current_ledger_sequence(&self) -> u64 {
-        // Placeholder for actual ledger query logic
-        // In production, this would read from the consensus layer
-        100
+    pub fn pause_write_flushes(&self) -> Result<(), String> {
+        if self.paused.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("Writes already paused".to_string());
+        }
+        self.paused.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 
-    /// Checks if the database write flushes are currently paused.
-    pub async fn is_paused(&self) -> bool {
-        *self.is_flush_paused.lock().await
+    pub fn resume_write_flushes(&self) -> Result<(), String> {
+        if !self.paused.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("Writes not paused".to_string());
+        }
+        self.paused.store(false, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
     }
 }

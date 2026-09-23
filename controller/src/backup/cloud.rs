@@ -1,98 +1,111 @@
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::time::Duration;
 
-/// Trait for cloud storage provider operations.
-/// Supports AWS EBS, GCP PD, or local storage providers.
-pub trait CloudStorageProvider {
-    /// Creates a snapshot of the specified volume.
-    async fn create_snapshot(&self, volume_id: String, metadata: u64) -> String;
+use crate::backup::snapshot::{Snapshot, SnapshotManager, DbHandle};
 
-    /// Deletes a snapshot by ID.
-    async fn delete_snapshot(&self, snapshot_id: String);
+/// Defines the cloud provider interface for backup operations.
+pub trait CloudProvider {
+    /// Creates a snapshot on the cloud provider.
+    async fn create_snapshot(&self, volume_id: &str, snapshot_id: &str) -> Result<(), String>;
+
+    /// Deletes a snapshot from the cloud provider.
+    async fn delete_snapshot(&self, snapshot_id: &str) -> Result<(), String>;
 
     /// Restores a volume from a snapshot.
-    async fn restore_from_snapshot(&self, snapshot_id: String, target_volume_id: String) -> String;
-
-    /// Lists all snapshots for a given volume or filter.
-    async fn list_snapshots(&self, filter: Option<String>) -> Vec<String>;
+    async fn restore_volume(&self, snapshot_id: &str, target_volume_id: &str) -> Result<(), String>;
 }
 
-/// Manager for cloud backup operations.
-/// Handles retention policies and snapshot lifecycle.
-pub struct CloudBackupManager {
-    provider: Arc<dyn CloudStorageProvider + Send + Sync>,
+/// Controller for managing cloud backups and retention policies.
+pub struct CloudBackupController {
+    snapshot_manager: SnapshotManager,
+    provider: Box<dyn CloudProvider>,
     retention_days: u64,
-    /// Tracks snapshot metadata for retention enforcement
-    snapshots: Arc<Mutex<Vec<SnapshotRecord>>>,
 }
 
-#[derive(Debug, Clone)]
-struct SnapshotRecord {
-    id: String,
-    volume_id: String,
-    created_at: u64,
-    is_valid: bool,
-}
-
-impl CloudBackupManager {
-    pub fn new(provider: Arc<dyn CloudStorageProvider + Send + Sync>, retention_days: u64) -> Self {
+impl CloudBackupController {
+    pub fn new(snapshot_manager: SnapshotManager, provider: Box<dyn CloudProvider>, retention_days: u64) -> Self {
         Self {
+            snapshot_manager,
             provider,
             retention_days,
-            snapshots: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    /// Creates a new snapshot and registers it for retention tracking.
-    pub async fn create_snapshot(&self, volume_id: String, metadata: u64) -> String {
-        let snapshot_id = self.provider.create_snapshot(volume_id.clone(), metadata).await;
-        let record = SnapshotRecord {
-            id: snapshot_id.clone(),
-            volume_id,
-            created_at: metadata,
-            is_valid: true,
-        };
-        let mut snaps = self.snapshots.lock().await;
-        snaps.push(record);
-        snapshot_id
+    /// Main controller loop that triggers snapshot creation and enforces retention.
+    pub async fn run_controller_loop(&self, volume_id: &str, ledger_sequence: u64) -> Result<(), String> {
+        // 1. Create Snapshot
+        let snapshot = self.snapshot_manager.create_snapshot(volume_id, ledger_sequence).await?;
+
+        // 2. Sync with Cloud Provider
+        self.provider.create_snapshot(volume_id, &snapshot.id).await?;
+
+        // 3. Enforce Retention Policy
+        self.enforce_retention_policy(volume_id).await?;
+
+        Ok(())
     }
 
-    /// Enforces retention policy by purging expired snapshot assets.
-    pub async fn enforce_retention(&self, current_time: u64) {
-        let retention_seconds = self.retention_days * 24 * 60 * 60;
-        let mut snaps = self.snapshots.lock().await;
-        let expired: Vec<String> = snaps
-            .iter()
-            .filter(|s| current_time - s.created_at > retention_seconds)
-            .map(|s| s.id.clone())
-            .collect();
+    /// Enforces retention policy by purging expired snapshots.
+    async fn enforce_retention_policy(&self, volume_id: &str) -> Result<(), String> {
+        let current_time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
 
-        for id in expired {
-            self.provider.delete_snapshot(id.clone()).await;
-            snaps.retain(|s| s.id != id);
-            println!("Expired snapshot deleted: {}", id);
+        let snapshots = self.snapshot_manager.list_snapshots_for_volume(volume_id);
+        let mut expired_snapshots = Vec::new();
+
+        for snapshot in snapshots {
+            let age_days = (current_time - snapshot.timestamp) / (24 * 60 * 60);
+            if age_days > self.retention_days {
+                expired_snapshots.push(snapshot.id.clone());
+            }
         }
+
+        for snapshot_id in expired_snapshots {
+            println!("Purging expired snapshot: {}", snapshot_id);
+            self.provider.delete_snapshot(&snapshot_id).await?;
+        }
+
+        Ok(())
     }
 
     /// Restores a volume from a validated snapshot.
-    /// Returns the new volume ID upon successful restoration.
-    pub async fn restore_from_snapshot(&self, snapshot_id: String, target_volume_id: String) -> String {
-        // Validate snapshot exists and is valid
-        let snaps = self.snapshots.lock().await;
-        let snapshot = snaps.iter().find(|s| s.id == snapshot_id && s.is_valid);
-        
-        if snapshot.is_none() {
-            panic!("Invalid or missing snapshot ID: {}", snapshot_id);
+    pub async fn restore_from_snapshot(&self, snapshot_id: &str, target_volume_id: &str) -> Result<(), String> {
+        // Validate snapshot exists
+        let snapshot = self.snapshot_manager.get_snapshot(snapshot_id)
+            .ok_or_else(|| format!("Snapshot {} not found", snapshot_id))?;
+
+        if snapshot.status != crate::backup::snapshot::SnapshotStatus::Completed {
+            return Err(format!("Snapshot {} is not in completed state", snapshot_id));
         }
 
-        drop(snaps);
+        // Restore volume
+        self.provider.restore_volume(snapshot_id, target_volume_id).await?;
 
-        let new_volume_id = self
-            .provider
-            .restore_from_snapshot(snapshot_id, target_volume_id)
-            .await;
-        
-        println!("Volume restored from snapshot to: {}", new_volume_id);
-        new_volume_id
+        Ok(())
+    }
+}
+
+/// Mock Cloud Provider for testing.
+pub struct MockCloudProvider;
+
+impl CloudProvider for MockCloudProvider {
+    async fn create_snapshot(&self, _volume_id: &str, _snapshot_id: &str) -> Result<(), String> {
+        // Simulate cloud API call
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Ok(())
+    }
+
+    async fn delete_snapshot(&self, _snapshot_id: &str) -> Result<(), String> {
+        // Simulate cloud API call
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Ok(())
+    }
+
+    async fn restore_volume(&self, _snapshot_id: &str, _target_volume_id: &str) -> Result<(), String> {
+        // Simulate cloud API call
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        Ok(())
     }
 }
