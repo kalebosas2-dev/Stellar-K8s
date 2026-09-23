@@ -1,2 +1,2 @@
 pub mod quorum;
-pub mod backup;
+pub modum backup;

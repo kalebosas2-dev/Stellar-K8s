@@ -1,147 +1,92 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{info, warn, error};
+use tokio::time::interval;
 
-/// Represents a persistent volume snapshot in the system.
+/// Represents a persistent volume snapshot state.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub id: String,
     pub volume_id: String,
     pub created_at: u64,
-    pub status: SnapshotStatus,
-    pub tags: Vec<(String, String)>,
+    pub is_valid: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum SnapshotStatus {
-    Pending,
-    Completed,
-    Failed(String),
-    Deleting,
+/// Controller responsible for managing the lifecycle of storage snapshots.
+/// It aligns snapshot creation with ledger sequence markers to ensure consistency.
+pub struct SnapshotController {
+    /// Interval for checking ledger sequences and triggering snapshots
+    check_interval: Duration,
+    /// Flag to pause database write flushes during snapshot initialization
+    is_flush_paused: Arc<Mutex<bool>>,
 }
 
-/// Manages the lifecycle of storage snapshots.
-pub struct SnapshotManager {
-    /// Simulated storage of snapshots
-    snapshots: Arc<Mutex<Vec<Snapshot>>>,
-    /// Retention period in seconds
-    retention_period_secs: u64,
-}
-
-impl SnapshotManager {
-    pub fn new(retention_period_secs: u64) -> Self {
+impl SnapshotController {
+    pub fn new(check_interval: Duration) -> Self {
         Self {
-            snapshots: Arc::new(Mutex::new(Vec::new())),
-            retention_period_secs,
+            check_interval,
+            is_flush_paused: Arc::new(Mutex::new(false)),
         }
     }
 
-    /// Initiates a snapshot for a given volume.
-    /// In a real implementation, this would pause DB writes, call the cloud API,
-    /// and resume writes.
-    pub async fn create_snapshot(&self, volume_id: &str, ledger_sequence: u64) -> Result<Snapshot, String> {
-        info!("Initializing snapshot for volume {} at ledger sequence {}", volume_id, ledger_sequence);
+    /// Starts the controller loop.
+    /// This loop monitors ledger sequences and triggers snapshot API calls
+    /// when a new sequence marker is detected.
+    pub async fn run_loop(self, cloud_manager: Arc<crate::backup::cloud::CloudBackupManager>) {
+        let mut interval = interval(self.check_interval);
+        let mut last_snapshot_sequence: u64 = 0;
 
-        // Simulate pausing database write flushes for crash consistency
-        self.pause_writes().await;
+        loop {
+            interval.tick().await;
 
-        // Simulate API call delay
+            // In a real implementation, we would query the ledger for the current sequence.
+            // For this simulation, we assume a sequence increment mechanism.
+            let current_sequence = self.get_current_ledger_sequence().await;
+
+            if current_sequence > last_snapshot_sequence {
+                self.trigger_snapshot(&cloud_manager, current_sequence).await;
+                last_snapshot_sequence = current_sequence;
+            }
+        }
+    }
+
+    /// Triggers a snapshot creation aligned with the given ledger sequence.
+    /// Ensures crash consistency by pausing DB write flushes.
+    async fn trigger_snapshot(
+        &self,
+        cloud_manager: &Arc<crate::backup::cloud::CloudBackupManager>,
+        sequence: u64,
+    ) {
+        // Pause database write flushes to guarantee crash consistency
+        {
+            let mut paused = self.is_flush_paused.lock().await;
+            *paused = true;
+        }
+
+        // Simulate brief pause for DB flush
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        let snapshot_id = format!("snap-{}-{}", volume_id, ledger_sequence);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        // Create snapshot via cloud provider
+        let snapshot_id = cloud_manager.create_snapshot(format!("vol-{}", sequence), sequence).await;
 
-        let snapshot = Snapshot {
-            id: snapshot_id.clone(),
-            volume_id: volume_id.to_string(),
-            created_at: now,
-            status: SnapshotStatus::Completed,
-            tags: vec![
-                ("ledger_sequence".to_string(), ledger_sequence.to_string()),
-                ("volume_id".to_string(), volume_id.to_string()),
-            ],
-        };
-
-        // Resume writes
-        self.resume_writes().await;
-
-        let mut snaps = self.snapshots.lock().await;
-        snaps.push(snapshot.clone());
-
-        info!("Snapshot {} created successfully", snapshot_id);
-        Ok(snapshot)
-    }
-
-    /// Lists all snapshots for a specific volume.
-    pub async fn list_snapshots(&self, volume_id: &str) -> Vec<Snapshot> {
-        let snaps = self.snapshots.lock().await;
-        snaps.iter()
-            .filter(|s| s.volume_id == volume_id)
-            .cloned()
-            .collect()
-    }
-
-    /// Deletes a specific snapshot by ID.
-    pub async fn delete_snapshot(&self, snapshot_id: &str) -> Result<(), String> {
-        let mut snaps = self.snapshots.lock().await;
-        let index = snaps.iter().position(|s| s.id == snapshot_id);
-
-        match index {
-            Some(idx) => {
-                snaps.remove(idx);
-                info!("Snapshot {} deleted", snapshot_id);
-                Ok(())
-            }
-            None => Err(format!("Snapshot {} not found", snapshot_id)),
+        // Resume database write flushes
+        {
+            let mut paused = self.is_flush_paused.lock().await;
+            *paused = false;
         }
+
+        println!("Snapshot created for sequence {}: {}", sequence, snapshot_id);
     }
 
-    /// Enforces retention policy by purging expired snapshots.
-    pub async fn enforce_retention(&self) -> usize {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        let mut snaps = self.snapshots.lock().await;
-        let initial_count = snaps.len();
-
-        snaps.retain(|s| {
-            let age = now - s.created_at;
-            if age > self.retention_period_secs {
-                warn!("Purging expired snapshot {} (age: {}s)", s.id, age);
-                false
-            } else {
-                true
-            }
-        });
-
-        let purged_count = initial_count - snaps.len();
-        if purged_count > 0 {
-            info!("Retention policy enforced: purged {} snapshots", purged_count);
-        }
-        purged_count
+    /// Simulates fetching the current ledger sequence.
+    async fn get_current_ledger_sequence(&self) -> u64 {
+        // Placeholder for actual ledger query logic
+        // In production, this would read from the consensus layer
+        100
     }
 
-    /// Simulates pausing database writes.
-    async fn pause_writes(&self) {
-        // In production: Acquire write lock, flush WAL, pause replication
-        info!("Pausing database writes for snapshot consistency");
-    }
-
-    /// Simulates resuming database writes.
-    async fn resume_writes(&self) {
-        // In production: Release write lock, resume replication
-        info!("Resuming database writes");
-    }
-
-    /// Validates a snapshot by checking its existence and status.
-    pub async fn validate_snapshot(&self, snapshot_id: &str) -> bool {
-        let snaps = self.snapshots.lock().await;
-        snaps.iter().any(|s| s.id == snapshot_id && s.status == SnapshotStatus::Completed)
+    /// Checks if the database write flushes are currently paused.
+    pub async fn is_paused(&self) -> bool {
+        *self.is_flush_paused.lock().await
     }
 }
