@@ -56,7 +56,6 @@ requirements.md
 CI_CD_REVIEW.md
 
 # IDE
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -95,3 +94,8 @@ starfield.html
 # mkdocs build output from `make docs-build`
 /site/
 
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+config.bat
+node_modules
